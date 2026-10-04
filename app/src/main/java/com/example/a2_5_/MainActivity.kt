@@ -1,20 +1,24 @@
 package com.example.a2_5_
 
 import android.Manifest
+import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.Environment
+import android.provider.MediaStore
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -23,6 +27,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import coil3.compose.AsyncImage
@@ -49,7 +54,6 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-// Каталог фотографий приложения.
 private fun picturesDirectory(context: Context): File {
     val directory = context.getExternalFilesDir(
         Environment.DIRECTORY_PICTURES
@@ -62,7 +66,6 @@ private fun picturesDirectory(context: Context): File {
     return directory
 }
 
-// Создаём файл с именем IMG_yyyyMMdd_HHmmss.jpg.
 private fun createPhotoFile(context: Context): File {
     val directory = picturesDirectory(context)
     val formatter = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
@@ -76,15 +79,12 @@ private fun createPhotoFile(context: Context): File {
 
         if (file.createNewFile()) return file
 
-        // При совпадении имени не перезаписываем существующий файл.
         time += 1_000L
     }
 }
 
-// Сканируем папку при запуске и после добавления фотографии.
 private fun readPhotos(context: Context): List<File> {
     val directory = picturesDirectory(context)
-
     val files = directory.listFiles()
         ?: throw IOException("Не удалось прочитать папку фотографий")
 
@@ -94,6 +94,63 @@ private fun readPhotos(context: Context): List<File> {
         it.isFile && pattern.matches(it.name) && it.length() > 0L
     }.sortedByDescending {
         it.name
+    }
+}
+
+// Сохраняем копию фотографии в системную галерею.
+// Исходное фото остаётся в папке приложения.
+private fun exportToGallery(context: Context, source: File) {
+    if (!source.isFile || source.length() == 0L) {
+        throw IOException("Фотография недоступна")
+    }
+
+    val resolver = context.contentResolver
+    val values = ContentValues().apply {
+        put(MediaStore.Images.Media.DISPLAY_NAME, source.name)
+        put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+        put(
+            MediaStore.Images.Media.RELATIVE_PATH,
+            "${Environment.DIRECTORY_PICTURES}/PhotoGallery_Kotsyuba"
+        )
+        put(MediaStore.Images.Media.IS_PENDING, 1)
+    }
+
+    val uri = resolver.insert(
+        MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+        values
+    ) ?: throw IOException("Не удалось создать копию фотографии")
+
+    try {
+        val expectedSize = source.length()
+
+        val copied = source.inputStream().use { input ->
+            val output = resolver.openOutputStream(uri)
+                ?: throw IOException("Не удалось открыть файл для записи")
+
+            output.use {
+                input.copyTo(it)
+            }
+        }
+
+        if (copied == 0L || copied != expectedSize) {
+            throw IOException("Фотография скопирована не полностью")
+        }
+
+        val ready = ContentValues().apply {
+            put(MediaStore.Images.Media.IS_PENDING, 0)
+        }
+
+        if (resolver.update(uri, ready, null, null) == 0) {
+            throw IOException("Не удалось завершить экспорт")
+        }
+    } catch (error: Exception) {
+        try {
+            resolver.delete(uri, null, null)
+        } catch (cleanupError: Exception) {
+            error.addSuppressed(cleanupError)
+        }
+
+        throw error
     }
 }
 
@@ -110,6 +167,7 @@ private fun PhotoGallery() {
 
     var loading by remember { mutableStateOf(true) }
     var preparing by remember { mutableStateOf(false) }
+    var exporting by remember { mutableStateOf(false) }
     var reloadVersion by remember { mutableIntStateOf(0) }
 
     var selectedPath by rememberSaveable {
@@ -149,7 +207,6 @@ private fun PhotoGallery() {
             try {
                 val saved = withContext(Dispatchers.IO) {
                     val file = path?.let { File(it) }
-
                     val valid = success &&
                             file != null &&
                             file.length() > 0L
@@ -189,7 +246,9 @@ private fun PhotoGallery() {
     }
 
     fun launchCamera() {
-        if (preparing || pendingPath != null || loading) return
+        if (preparing || exporting ||
+            pendingPath != null || loading
+        ) return
 
         preparing = true
 
@@ -243,8 +302,35 @@ private fun PhotoGallery() {
         }
     }
 
+    fun exportPhoto(file: File) {
+        if (exporting || preparing ||
+            loading || pendingPath != null
+        ) return
+
+        exporting = true
+
+        scope.launch {
+            val message = try {
+                withContext(Dispatchers.IO) {
+                    exportToGallery(context, file)
+                }
+
+                "Фото добавлено в галерею"
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                error.message ?: "Не удалось экспортировать фото"
+            } finally {
+                exporting = false
+            }
+
+            snackbar.showSnackbar(message)
+        }
+    }
+
     val canTakePhoto = !loading &&
             !preparing &&
+            !exporting &&
             pendingPath == null
 
     val takePhoto: () -> Unit = {
@@ -295,8 +381,7 @@ private fun PhotoGallery() {
             SnackbarHost(snackbar)
         },
         floatingActionButton = {
-            if (
-                selectedPath == null &&
+            if (selectedPath == null &&
                 photos.isNotEmpty() &&
                 canTakePhoto
             ) {
@@ -317,14 +402,35 @@ private fun PhotoGallery() {
 
             when {
                 path != null -> {
-                    AsyncImage(
-                        model = File(path),
-                        contentDescription = "Выбранная фотография",
-                        contentScale = ContentScale.Fit,
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(12.dp)
-                    )
+                    Column(Modifier.fillMaxSize()) {
+                        AsyncImage(
+                            model = File(path),
+                            contentDescription = "Выбранная фотография",
+                            contentScale = ContentScale.Fit,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f)
+                                .padding(12.dp)
+                        )
+
+                        Button(
+                            onClick = {
+                                exportPhoto(File(path))
+                            },
+                            enabled = canTakePhoto,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(16.dp)
+                        ) {
+                            Text(
+                                if (exporting) {
+                                    "Экспорт…"
+                                } else {
+                                    "Экспорт в галерею"
+                                }
+                            )
+                        }
+                    }
                 }
 
                 loading -> {
@@ -372,31 +478,88 @@ private fun PhotoGallery() {
                             items = photos,
                             key = { it.name }
                         ) { file ->
-                            Card(
-                                onClick = {
+                            PhotoTile(
+                                file = file,
+                                exportEnabled = canTakePhoto,
+                                onOpen = {
                                     selectedPath = file.absolutePath
+                                },
+                                onExport = {
+                                    exportPhoto(file)
                                 }
-                            ) {
-                                AsyncImage(
-                                    model = file,
-                                    contentDescription = "Фотография ${file.name}",
-                                    contentScale = ContentScale.Crop,
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .aspectRatio(1f)
-                                )
-                            }
+                            )
                         }
                     }
                 }
             }
 
-            if (preparing || pendingPath != null) {
+            if (preparing || exporting || pendingPath != null) {
                 LinearProgressIndicator(
                     modifier = Modifier
                         .fillMaxWidth()
                         .align(Alignment.TopCenter)
                 )
+            }
+        }
+    }
+}
+
+@Composable
+private fun PhotoTile(
+    file: File,
+    exportEnabled: Boolean,
+    onOpen: () -> Unit,
+    onExport: () -> Unit
+) {
+    var menuExpanded by remember {
+        mutableStateOf(false)
+    }
+
+    Card(onClick = onOpen) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(1f)
+        ) {
+            AsyncImage(
+                model = file,
+                contentDescription = "Фотография ${file.name}",
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.matchParentSize()
+            )
+
+            Box(Modifier.align(Alignment.TopEnd)) {
+                IconButton(
+                    onClick = { menuExpanded = true },
+                    modifier = Modifier
+                        .padding(2.dp)
+                        .background(
+                            MaterialTheme.colorScheme.surface.copy(
+                                alpha = 0.9f
+                            ),
+                            CircleShape
+                        )
+                ) {
+                    Text("⋮", fontSize = 24.sp)
+                }
+
+                DropdownMenu(
+                    expanded = menuExpanded,
+                    onDismissRequest = {
+                        menuExpanded = false
+                    }
+                ) {
+                    DropdownMenuItem(
+                        text = {
+                            Text("Экспорт в галерею")
+                        },
+                        enabled = exportEnabled,
+                        onClick = {
+                            menuExpanded = false
+                            onExport()
+                        }
+                    )
+                }
             }
         }
     }
